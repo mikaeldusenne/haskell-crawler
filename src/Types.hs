@@ -25,7 +25,8 @@ data Config = Config {
   sha256sumsfile :: String,
   login_needed_tag :: Tag String,
   login_env_prefix :: String,
-  alreadies :: [(SHAString, String)]
+  alreadies :: [(SHAString, String)],
+  alreadies_urls :: [(SHAString, String)]
   }
   deriving (Show)
 
@@ -38,12 +39,15 @@ defaultconfig = Config {
   sha256sumsfile = "sha256sums.txt",
   login_needed_tag = TagOpen "button" [("aria-label","Please sign in")],
   login_env_prefix = "scrapper_",
-  alreadies = []
+  alreadies = [],
+  alreadies_urls = [],
   }
 
 createConfig cfg = do
   shas <- map read . lines <$> readFile (download_folder cfg </> sha256sumsfile cfg)
   return cfg{alreadies=shas}
   
+handle_url_cache url = do
+  urls <- gets 
   
   

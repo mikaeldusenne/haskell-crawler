@@ -118,22 +118,33 @@ download url dest =
     issym <- liftIO $ pathIsSymbolicLink dest `catchIOError` (\_ -> return False)
       
     -- ex <- liftIO $ doesPathExist dest >>= (\pex -> pathIsSymbolicLink dest >>= (\sex -> return (pex || sex)))
-      
+
+    let fix_symlink = do
+          liftIO$ putStrLn "bad symlink, fixing..."
+          target <- liftIO$ getSymbolicLinkTarget dest
+          liftIO$ putStrLn $ "old target is: " ++ target
+          let target' = joinPath . tail . splitPath $ target
+          liftIO$ removeFile dest
+          
+          ifm (liftIO$ doesPathExist target')
+            (do
+                liftIO$do
+                  putStrLn $ "new target is: " ++ target'
+                  createSymbolicLink target' dest
+                return (Right ())
+            )
+            (do
+                liftIO$ putStrLn $ target' ++ " does not exist either. deleting symlink"
+                download url dest
+            )
+          
+    
     if (pathok || issym)
-      then (liftIO $ (
-      do
-        putStrLn $ " skipping, path exists."
-        when (issym) (
-          do
-            putStrLn "bad symlink, fixing..."
-            target <- getSymbolicLinkTarget dest
-            putStrLn $ "old target is: " ++ target
-            let target' = joinPath . tail . splitPath $ target
-            putStrLn $ "new target is: " ++ target'
-            removeFile dest
-            createSymbolicLink target' dest
-          )
-      )) >> return (Right ())
+      then do
+      liftIO$ putStrLn $ " skipping, path exists."
+      if (issym && not pathok)
+        then fix_symlink
+        else return (Right ())
       else downloadfile
 
 downloader :: ([[Tag String] -> [String]]) -> FilePath -> [FilePath] -> String -> PPM (Either String ())
@@ -197,13 +208,12 @@ ff x@(paths, url) (fm:fms) = do
         Left e -> return $ [Left e]
         Right n -> do
           let n' = map (applyToFst (`append` paths)) n
-          (reduce (++)) <$> mapM (`ff` fms) n'
-
-      liftIO $ putStrLn $ "*** Finished <"++ joinPath paths ++"> ***"
-      liftIO $ writeFile finishedpath ""
+          ans <- (reduce (++)) <$> mapM (`ff` fms) n'
+          liftIO $ putStrLn $ "*** Finished <"++ joinPath paths ++"> ***"
+          liftIO $ writeFile finishedpath ""
+          return ans
       
       return result
-          
 
 
 -- f :: [T] -> [T -> T'] -> PPM [Either (String, String) ()]
