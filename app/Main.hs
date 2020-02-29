@@ -53,17 +53,16 @@ main = do
           login_path = "member/login_new.php",
           login_arg_login = "amember_login",
           login_arg_pass = "amember_pass",
-          sha256sumsfile = "sha256sums.txt",
+          urlsfile = "urls.txt",
           login_needed_tag = TagOpen "button" [("aria-label","Please sign in")],
           login_env_prefix = "pp101_"
           }
 
+  
   let -- run :: PPM [Either String ()]
       run = do
         login'
-        ((download_dest </>) <$> gets sha256sumsfile) >>= \shf ->
-          liftIO $ (not <$> doesFileExist shf) >>= (`when` writeFile shf "")
-        let l = words "absolute-beginner beginner intermediate advanced bonus"
+        let l = reverse $ words "bonus absolute-beginner beginner intermediate advanced"
         let start :: [T]
             start = map (\e -> ([e], "lesson-library" </> e)) l
             fs :: [T -> T']

@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 module Scrapper where
 
 import qualified Data.ByteString as BS
@@ -23,6 +24,7 @@ import qualified Data.ByteString.Lazy as LB
 import System.IO.Temp
 import Control.Monad.Zip
 import System.IO.Error
+-- import Control.Monad.Trans.Either
 
 import Types
 import Control.Monad.Trans.State
@@ -73,107 +75,115 @@ url_basename = last . takeWhile (not . (isPrefixOf "?")) . splitPath
 pathdiff a b = reduce (</>) $ take (length a' - 1) (repeat "..") ++ a'
   where (same, a') = applyToSnd (map fst) . span (\(a,b) -> a==b) . uncurry zip . applyToTuple splitPath $ (a, b)
 
-download :: String -> FilePath -> PPM (Either String ())
+download :: URLString -> FilePath -> PPM (Either String ())
 download url dest =
   do
     url' <- mkurl url
-    shafile <- gets sha256sumsfile
+    -- liftIO $ putStrLn $ "Downloading " ++ url' ++ " to " ++ dest ++ "..."
     dldir <- gets download_folder
-    shas <- gets alreadies
     cfg <- get
-    let shf = dldir </> shafile
-    let downloadfile = do
-          tmp <- liftIO $ emptyTempFile dldir "tmpdownload"
-          let update_alreadies sha = do
-                put (cfg{alreadies=append (sha, dest) shas})
-                liftIO $ appendFile shf . (++"\n") $ show (sha, dest)
-              dltmp = (liftIO) . (BS.writeFile tmp)
-              finish (Left e) = do
-                liftIO $ removeFile tmp
-                return (Left e)
-              finish (Right _) = do
-                sha <- liftIO $ (show . sha256) <$> LB.readFile tmp
-                let already = (snd <$>) . safe_head $ filter ((==sha) . fst) $ shas
-                case already of
-                  Nothing -> do
-                    liftIO (renamePath tmp dest)
-                    update_alreadies sha
-                    return $ Right ()
-                  Just originalpath -> do
-                    liftIO $ do
-                      removeFile tmp
-                      putStrLn $ "Symlink " ++ dest ++ " --> " ++ originalpath
-                      createSymbolicLink (pathdiff originalpath dest) dest
-                    return $ Right ()
-          liftIO $ threadDelay (2*10^5) >>
-            putStr (url' ++ "  ")
-          filebs <- liftIO $ openURIWithOpts [CurlFollowLocation True, CurlCookieFile cookiefilepath] url'
-          dl <- case filebs of
-            Left e -> return (Left e)
-            Right bs -> Right <$> dltmp bs
-          finish dl
-    -- ex <- liftIO ((liftM (||)) (doesPathExist dest) (pathIsSymbolicLink dest) )
-    pathok <- liftIO $ doesPathExist dest
-    
-    issym <- liftIO $ pathIsSymbolicLink dest `catchIOError` (\_ -> return False)
+    tmp <- liftIO $ emptyTempFile dldir "tmpdownload"
+
+    liftIO $ do
+      threadDelay (2*10^5) >>
+        putStrLn url'
       
-    -- ex <- liftIO $ doesPathExist dest >>= (\pex -> pathIsSymbolicLink dest >>= (\sex -> return (pex || sex)))
-
-    let fix_symlink = do
-          liftIO$ putStrLn "bad symlink, fixing..."
-          target <- liftIO$ getSymbolicLinkTarget dest
-          liftIO$ putStrLn $ "old target is: " ++ target
-          let target' = joinPath . tail . splitPath $ target
-          liftIO$ removeFile dest
-          
-          ifm (liftIO$ doesPathExist target')
-            (do
-                liftIO$do
-                  putStrLn $ "new target is: " ++ target'
-                  createSymbolicLink target' dest
-                return (Right ())
-            )
-            (do
-                liftIO$ putStrLn $ target' ++ " does not exist either. deleting symlink"
-                download url dest
-            )
-          
+      (openURIWithOpts [CurlFollowLocation True, CurlCookieFile cookiefilepath] url') >>= (
+        \case
+          Right bs -> do
+            BS.writeFile tmp bs
+            -- putStrLn $ "renaming " ++ surround "'" tmp ++ " to " ++ surround "'" dest
+            renamePath tmp dest
+            return $ Right ()
+          Left e -> return $ Left e
+        )
     
-    if (pathok || issym)
-      then do
-      liftIO$ putStrLn $ " skipping, path exists."
-      if (issym && not pathok)
-        then fix_symlink
-        else return (Right ())
-      else downloadfile
-
 downloader :: ([[Tag String] -> [String]]) -> FilePath -> [FilePath] -> String -> PPM (Either String ())
-downloader linkgenerators dldir p url3 = do
-  let dest =  reduce (</>) $ dldir:p
+downloader linkgenerators dldir p url = do
+  let dest = reduce (</>) $ dldir:p
   logtag <- gets login_needed_tag
   liftIO $ do
     putStr dest
     createDirectoryIfMissing True $ dest
   
     putStrLn " Download..."
-    putStrLn $ nice'title url3
+    putStrLn $ nice'title url
     
-  tags <- parseTags <$> openURL url3
+  tags <- parseTags <$> openURL url
   
   let links :: [String]
       links = (filter ((>0) . length)) . flatten . map ($tags) $ linkgenerators
-  let process e = download e (dest </> url_basename e)
+  let process e = do
+        let destpath = dest </> fix (url_basename e)
+              where fix x | isSuffixOf "/" x = init x ++ ".html"
+                          | otherwise = x
+
+        -- liftIO $ putStrLn $ "{process} " ++ e ++ " ==@ " ++ destpath
+
+        pathok <- liftIO $ doesPathExist destpath
+    
+        issym <- liftIO $ pathIsSymbolicLink destpath `catchIOError` (\_ -> return False)
+    
+        let fix_symlink = do
+              liftIO$ putStrLn "bad symlink, fixing..."
+              target <- liftIO$ getSymbolicLinkTarget destpath
+              liftIO$ putStrLn $ "old target is: " ++ target
+              let target' = joinPath . tail . splitPath $ target
+              liftIO$ removeFile destpath
+              
+              ifm (liftIO$ doesPathExist target')
+                (do
+                    liftIO$do
+                      putStrLn $ "new target is: " ++ target'
+                      createSymbolicLink target' destpath
+                    return (Right ())
+                )
+                (do
+                    liftIO$ putStrLn $ target' ++ " does not exist either. deleting symlink"
+                    download url destpath
+                )
+        let download_or_cache = do
+              handle_url_cache e >>= (
+                \case 
+                  Nothing -> do
+                    
+                    download e destpath
+                    
+                    cfg <- get
+                    urls <- gets alreadies_urls
+                    -- liftIO . putStrLn $ "adding " ++ e ++ " to the FUCKING list"
+                    put (cfg{ alreadies_urls = append (e, destpath) urls})
+                    liftIO . (`appendFile` (show (e, destpath) ++ "\n")) $ download_folder cfg </> urlsfile cfg
+                    return $ Right ()
+                  Just originalpath -> do
+                    liftIO $ do
+                      -- print $ "wtf WTH" ++ originalpath
+                      putStrLn $ "Symlink " ++ destpath ++ " --> " ++ originalpath
+                      createSymbolicLink (pathdiff originalpath destpath) destpath
+                    return $ Right ()
+                )
+              
+        
+        if (pathok || issym)
+          then do
+          liftIO$ putStrLn $ " skipping, path exists."
+          if (issym && not pathok)
+            then fix_symlink
+            else return (Right ())
+          else download_or_cache
+  
       
   if (length links > 0)
-    then ((reduce (>>))<$>) $ mapM process links
+    then do
+      (((reduce (>>))<$>) $ mapM process links) >> process url
     else do
       if ((>0) . length . filter (~== logtag) $ tags)
         then do
           liftIO $ putStrLn "Re-logging-in..."
           login'
-          downloader linkgenerators dldir p url3
+          downloader linkgenerators dldir p url
         else do
-        let errmsg = "error: nothing to download in " ++ url3
+        let errmsg = "error: nothing to download in " ++ url
         -- liftIO $ print tags >> (putStrLn $ "error: nothing to download in " ++ url3)
         return (Left errmsg)
 

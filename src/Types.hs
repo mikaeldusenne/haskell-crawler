@@ -1,9 +1,17 @@
+{-# LANGUAGE LambdaCase #-}
 module Types where
 
 import Control.Monad.Trans.State
 import Text.HTML.TagSoup
 import Data.Digest.Pure.SHA
 import System.FilePath.Posix
+import Control.Monad.IO.Class (liftIO)
+import Network.Curl
+import List
+import Misc
+import System.Directory
+import Control.Monad
+
 
 type Pathl = [String]
 type T = (Pathl, String)
@@ -15,18 +23,22 @@ type PPM a = StateT Config IO a
 type Cache = [(String, String)]
 
 type SHAString = String
+type Path = String
+-- type URLString = String
+
 
 data Config = Config {
-  download_folder :: String,
-  base :: String,
+  download_folder :: Path,
+  base :: URLString,
   login_path :: String,
   login_arg_login :: String,
   login_arg_pass :: String,
-  sha256sumsfile :: String,
+  -- sha256sumsfile :: String,
+  urlsfile :: Path,
   login_needed_tag :: Tag String,
   login_env_prefix :: String,
-  alreadies :: [(SHAString, String)],
-  alreadies_urls :: [(SHAString, String)]
+  -- alreadies :: [(SHAString, String)],
+  alreadies_urls :: [(URLString, Path)]
   }
   deriving (Show)
 
@@ -36,18 +48,25 @@ defaultconfig = Config {
   login_path = "login.php",
   login_arg_login = "member_login",
   login_arg_pass = "member_pass",
-  sha256sumsfile = "sha256sums.txt",
+  -- sha256sumsfile = "sha256sums.txt",
+  urlsfile = "urls.txt",
   login_needed_tag = TagOpen "button" [("aria-label","Please sign in")],
   login_env_prefix = "scrapper_",
-  alreadies = [],
-  alreadies_urls = [],
+  -- alreadies = [],
+  alreadies_urls = []
   }
 
 createConfig cfg = do
-  shas <- map read . lines <$> readFile (download_folder cfg </> sha256sumsfile cfg)
-  return cfg{alreadies=shas}
+  -- shas <- map read . lines <$> readFile (download_folder cfg </> sha256sumsfile cfg)
+  let shf = (download_folder cfg </> urlsfile cfg)
+  (not <$> doesFileExist shf) >>= (`when` writeFile shf "")
   
+  urls <- map read . lines <$> readFile (download_folder cfg </> urlsfile cfg)
+  return cfg{alreadies_urls=urls}
+  
+handle_url_cache :: URLString -> PPM (Maybe Path)
 handle_url_cache url = do
-  urls <- gets 
-  
-  
+  urls <- gets alreadies_urls
+  let f = (snd<$>) . safe_head . filter ((==url) . fst)
+  -- liftIO $ putStrLn $ ">>>>>>>>>>>>>>>>     " ++ show urls
+  return $ f urls
