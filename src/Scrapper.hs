@@ -2,18 +2,19 @@
 module Scrapper where
 
 import qualified Data.ByteString as BS
-import Lib
 import List
 
-import Data.List
+import Data.List (isPrefixOf, isSuffixOf)
 import Data.Char(toLower)
 import Network.Curl
 import Network.Curl.Download
 import Text.HTML.TagSoup
+import qualified Data.Text as T (pack, replace, unpack)
 import System.Directory
 import System.IO
-import System.FilePath.Posix
-import Misc
+import System.FilePath.Posix ((</>), joinPath, splitPath)
+
+import Misc (applyIf, alpha_num, ifm, joinPaths)
 import Tuple
 import System.Environment (getEnv, getArgs)
 import Control.Monad (when, foldM_)
@@ -26,42 +27,31 @@ import Control.Monad.Zip
 import System.IO.Error
 -- import Control.Monad.Trans.Either
 
+import List (splitOn)
 import Types
-import Control.Monad.Trans.State
+import Control.Monad.Trans.State (gets, put, get, StateT, runStateT)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad (liftM)
-
-
-mkurl s | isPrefixOf "http" s = return s
-        | otherwise = do
-            b <- gets base
-            return $ b </> applyIf (isPrefixOf "/") tail s
-
+import Helpers (retry, openURL, mkurl)
+import qualified Secrets
 
 cookiefilepath = "cookies"
 
 login :: [String] -> PPM ()
 login [login, pass] = do
   b <- gets base
-  lp <- gets login_path
+  Just lp <- gets login_path
   logk <- gets login_arg_login
   passk <- gets login_arg_pass
   liftIO $ curlPost (b </> lp) [logk++"="++login, passk++"="++pass]
 
-login' = do
-  prefix <- gets login_env_prefix
-  liftIO (mapM (getEnv . (prefix++)) ["LOGIN", "PASS"]) >>= login
-
-openURL :: URLString -> PPM String
-openURL x = do
-  x' <- mkurl x
-  liftIO $ snd <$> curlGetString x' [CurlFollowLocation True, CurlCookieFile cookiefilepath]
-
-mkname e = map f . trim "\r\n \t?" $ e
-  where f x = applyIf (not.(`elem` alpha_num)) (\_ -> '_') x
-
+login' = login [Secrets.login, Secrets.pass] -- do
+  -- prefix <- gets login_env_prefix
+  -- liftIO (mapM (getEnv . (prefix++)) ["LOGIN", "PASS"]) >>= login
+ 
 
 -- tag_class_f t cl f = map f . filter (~== TagOpen t [("class", cl)])
+-- apply f to all tags `t` with class `cl`
 tag_class_f ::
   String -> String -> (Tag [Char] -> b) -> [Tag [Char]] -> [b]
 tag_class_f t cl f = map f . filter ((cl `elem`) . words . fromAttrib "class") . filter (~== TagOpen t [])
@@ -75,32 +65,27 @@ url_basename = last . takeWhile (not . (isPrefixOf "?")) . splitPath
 pathdiff a b = reduce (</>) $ take (length a' - 1) (repeat "..") ++ a'
   where (same, a') = applyToSnd (map fst) . span (\(a,b) -> a==b) . uncurry zip . applyToTuple splitPath $ (a, b)
 
-download :: URLString -> FilePath -> PPM (Either String ())
-download url dest =
+download :: UrlWithDest -> PPM (Either String ())
+download UrlWithDest{url=url, dest=dest} =
   do
     url' <- mkurl url
-    -- liftIO $ putStrLn $ "Downloading " ++ url' ++ " to " ++ dest ++ "..."
     dldir <- gets download_folder
     cfg <- get
     tmp <- liftIO $ emptyTempFile dldir "tmpdownload"
 
     liftIO $ do
-      threadDelay (2*10^5) >>
-        putStrLn url'
-      
+      putStrLn url'
+      threadDelay (2*10^5)
       (openURIWithOpts [CurlFollowLocation True, CurlCookieFile cookiefilepath] url') >>= (
         \case
-          Right bs -> do
-            BS.writeFile tmp bs
-            -- putStrLn $ "renaming " ++ surround "'" tmp ++ " to " ++ surround "'" dest
-            renamePath tmp dest
-            return $ Right ()
-          Left e -> return $ Left e
+          Right bs -> (Right<$>) (BS.writeFile tmp bs >> renamePath tmp dest)
+          Left e -> doesPathExist tmp >>= (`when` removeFile tmp) >> (return $ Left e)
         )
     
-downloader :: ([[Tag String] -> [String]]) -> FilePath -> [FilePath] -> String -> PPM (Either String ())
-downloader linkgenerators dldir p url = do
-  let dest = reduce (</>) $ dldir:p
+downloader :: ([[Tag String] -> [URLString]]) -> FilePath -> UrlWithDest -> PPM (Either String ())
+downloader linkgenerators dldir p@UrlWithDest{url=url, dest=dest'} = do
+  -- let dest = reduce (</>) $ dldir:p
+  let dest = dldir </> dest'
   logtag <- gets login_needed_tag
   liftIO $ do
     putStr dest
@@ -109,7 +94,8 @@ downloader linkgenerators dldir p url = do
     putStrLn " Download..."
     putStrLn $ nice'title url
     
-  tags <- parseTags <$> openURL url
+  -- tags <- parseTags <$> openURL (Just cookiefilepath) url
+  tags <- extracturl url
   
   let links :: [String]
       links = (filter ((>0) . length)) . flatten . map ($tags) $ linkgenerators
@@ -140,15 +126,13 @@ downloader linkgenerators dldir p url = do
                 )
                 (do
                     liftIO$ putStrLn $ target' ++ " does not exist either. deleting symlink"
-                    download url destpath
+                    download UrlWithDest{url=url, dest=destpath}
                 )
-        let download_or_cache = do
+        let download_or_cache :: StateT Config IO (Either String ())
+            download_or_cache = do
               handle_url_cache e >>= (
                 \case 
-                  Nothing -> do
-                    
-                    download e destpath
-                    
+                  Nothing -> download UrlWithDest{url=e, dest=destpath} >> do
                     cfg <- get
                     urls <- gets alreadies_urls
                     -- liftIO . putStrLn $ "adding " ++ e ++ " to the FUCKING list"
@@ -156,11 +140,19 @@ downloader linkgenerators dldir p url = do
                     liftIO . (`appendFile` (show (e, destpath) ++ "\n")) $ download_folder cfg </> urlsfile cfg
                     return $ Right ()
                   Just originalpath -> do
-                    liftIO $ do
+                    if destpath == originalpath
+                      then (do
+                      liftIO $ putStrLn $ "warning: original and dest are the same. fixing."
+                      cfg <- get
+                      put $ cfg{ alreadies_urls=filter (not . (==destpath) . snd) $ alreadies_urls cfg }
+                      download_or_cache)
+                      else do
+                      liftIO $ do
                       -- print $ "wtf WTH" ++ originalpath
-                      putStrLn $ "Symlink " ++ destpath ++ " --> " ++ originalpath
-                      createSymbolicLink (pathdiff originalpath destpath) destpath
-                    return $ Right ()
+                        
+                        putStrLn $ "Symlink " ++ destpath ++ " --> " ++ originalpath
+                        createSymbolicLink (pathdiff originalpath destpath) destpath
+                      return $ Right ()
                 )
               
         
@@ -174,100 +166,90 @@ downloader linkgenerators dldir p url = do
   
       
   if (length links > 0)
-    then do
-      (((reduce (>>))<$>) $ mapM process links) >> process url
+    then (((reduce (>>))<$>) $ mapM process links) >> process url
     else do
       if ((>0) . length . filter (~== logtag) $ tags)
         then do
           liftIO $ putStrLn "Re-logging-in..."
           login'
-          downloader linkgenerators dldir p url
+          downloader linkgenerators dldir p
         else do
         let errmsg = "error: nothing to download in " ++ url
         -- liftIO $ print tags >> (putStrLn $ "error: nothing to download in " ++ url3)
         return (Left errmsg)
 
-ff :: T -> [T -> T'] -> PPM [Either (String, String) ()]
+
+
+
+ff :: UrlWithDest -> [UrlWithDest -> PPM (Either String [UrlWithDest])] -> PPM [Either (String, String) ()]
 ff _ [] = return $ [Right ()]
-ff x@(paths, url) (fm:fms) = do
-  dld <- gets download_folder
-  let finishedpath = dld </> joinPath paths </> "finished"
-  alreadyDone <- liftIO $ fileExist finishedpath
+ff x@UrlWithDest{dest=path, url=url} (fm:fms) = do
+  let finishedpath = path </> "finished"
   
+  alreadyDone <- liftIO $ fileExist finishedpath
   if alreadyDone
+    
     then do
-    liftIO $ putStrLn $ joinPath paths ++ " has already been downloaded."
+    liftIO $ putStrLn $ path ++ " has already been downloaded."
     return $ [Right ()]
+    
     else do
-      let g k = do
-            ans <- fm x
-            case ans of
-              Left e -> do liftIO $ do
-                             putStrLn $ show x ++ "Error, retrying in 2s..."
-                             threadDelay (2*10^6)
-                           if k>0
-                             then g (k-1)
-                             else do
-                             liftIO (putStrLn (show x ++ " is not working for real...!")) >> return []
-                             return $ Left (url, e)
-              Right ok -> return $ (Right ok)
-                
-      next <- g 2
+      next <- retry 2 (show x) (fm x)
       
-      result <- case next of
+      let prependPath UrlWithDest{url=url, dest=dest} = UrlWithDest{url=url, dest=path</>dest}
+      
+      case next of
         Left e -> return $ [Left e]
         Right n -> do
-          let n' = map (applyToFst (`append` paths)) n
-          ans <- (reduce (++)) <$> mapM (`ff` fms) n'
-          liftIO $ putStrLn $ "*** Finished <"++ joinPath paths ++"> ***"
+          let n' :: [UrlWithDest]
+              n' = map prependPath n
+          -- let n' = applyToFst (`append` paths) n
+          ans <- flatten <$> mapM (`ff` fms) n'
+          -- liftIO $ putStrLn $ "*** Finished <"++ path ++"> ***"
           liftIO $ writeFile finishedpath ""
           return ans
       
-      return result
+
+-- takes a `url`, curl it and parse tags
+extracturl :: URLString -> PPM [Tag String]
+-- extracturl u = liftIO (threadDelay (10^5)) >> parseTags <$> openURL (Just cookiefilepath) u
+extracturl u = do
+  liftIO (threadDelay (10^5))
+  Right result <- (retry 3 ("openurl " ++ u) $ openURL (Just cookiefilepath) u)
+  return $ parseTags result
 
 
--- f :: [T] -> [T -> T'] -> PPM [Either (String, String) ()]
--- f u (fm:fms) = do
---   dld <- gets download_folder
---   liftIO $ print u
---   let run :: [([String], String)] -> PPM [Either (String, String) ()]
---       run [] = return $ [Right ()]
---       run (x@(a,b):xs) = do
---         let finishedpath = dld </> joinPath a </> "finished"
---         alreadyDone <- liftIO $ fileExist finishedpath
---         if alreadyDone
---           then return $ [Right ()]
---           else do
---             let g k = do
---                   ans <- fm x
---                   case ans of
---                     Left e -> do liftIO $ do
---                                    putStrLn $ show x ++ "Error, retrying in 2s..."
---                                    threadDelay (2*10^6)
---                                  if k>0
---                                    then g (k-1)
---                                    else do
---                                    liftIO (putStrLn (show x ++ " is not working for real...!")) >> return []
---                                    return $ Left (b, e)
---                     Right ok -> do
---                       liftIO $ putStrLn $ "*** Finished <"++ joinPath a ++"> ***"
---                       liftIO $ writeFile finishedpath ""
---                       return $ (Right ok)
---             next <- g 2
-            
---             ans <- case next of
---               Left e -> return $ [Left e]
---               Right n -> f (map (applyToFst (`append` a)) n) fms
---             (((ans++)<$>)<$>) run xs
---             -- ((ans++)<$>) $ run xs
---   run u
--- f u [] = return $ [Right ()]
+-- findlinks = takeWhile (~== "<li>") . dropWhile (~/= "<li>") . dropWhile (~/= "<div class=linklist>")
+
+pretty :: Show a => [a] -> String
+pretty l = unlines . map show $ l
 
 
+mainLoop :: Config -> [UrlWithDest -> PPM (Either String [UrlWithDest])] -> IO ()
+mainLoop cfg fs = do
+  let isNothing Nothing = True
+      isNothing _ = False
+      
+      -- run :: PPM [Either String ()]
+      run = do
+        login_path' <- gets login_path
+        when (not . isNothing $ login_path') login'
 
-extracturl url f = liftIO (threadDelay (10^5)) >> (f . parseTags) <$> openURL url
-a_class_href cl = tag_class_f "a" cl (fromAttrib "href")
-a_href_f f cl (_, b) = extracturl b (\tags -> let
-                                        hr = (a_class_href cl tags)
-                                        in zip (map f hr) hr)
-a_href_basename = a_href_f basename
+        -- let -- start :: [T]
+            -- start = map (\e -> UrlWithDest{url=e, dest="lesson-library" </> e}) l
+            -- fs :: [T -> T']
+        -- reduce (++) <$> mapM (`ff` fs) [defaultUrlWithDest]
+        dld <- gets download_folder
+        ff defaultUrlWithDest{dest=dld} fs 
+
+        
+  status <- runStateT run cfg
+  putStrLn "---------------------------------"
+  putStrLn "errors:"
+  (`mapM` fst status) (\e -> case e of
+                         Right () -> return ()
+                         Left err -> do
+                           -- putStrLn $ boxify (fst err) [snd err]
+                           putStrLn $ show ((fst err), [snd err])
+                      )
+  putStrLn "ok"

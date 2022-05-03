@@ -11,12 +11,13 @@ import List
 import Misc
 import System.Directory
 import Control.Monad
-
+import Text.StringLike
 
 type Pathl = [String]
 type T = (Pathl, String)
 type T' = PPM (Either String [(String, String)])
 
+type ErrorDetails = Either (String, String) ()
 
 type PPM a = StateT Config IO a
 
@@ -26,11 +27,15 @@ type SHAString = String
 type Path = String
 -- type URLString = String
 
+data UrlWithDest = UrlWithDest {url::URLString, dest::FilePath}
+  deriving (Show)
+
+defaultUrlWithDest = UrlWithDest {url="", dest=""}
 
 data Config = Config {
   download_folder :: Path,
   base :: URLString,
-  login_path :: String,
+  login_path :: Maybe String,
   login_arg_login :: String,
   login_arg_pass :: String,
   -- sha256sumsfile :: String,
@@ -45,7 +50,7 @@ data Config = Config {
 defaultconfig = Config {
   download_folder = "scrapper_downloads",
   base = "https://hello-world.com/",
-  login_path = "login.php",
+  login_path = Nothing, --"login.php",
   login_arg_login = "member_login",
   login_arg_pass = "member_pass",
   -- sha256sumsfile = "sha256sums.txt",
@@ -56,11 +61,14 @@ defaultconfig = Config {
   alreadies_urls = []
   }
 
+-- 
 createConfig cfg = do
   -- shas <- map read . lines <$> readFile (download_folder cfg </> sha256sumsfile cfg)
-  let shf = (download_folder cfg </> urlsfile cfg)
-  (not <$> doesFileExist shf) >>= (`when` writeFile shf "")
+  let dlf = download_folder cfg
+  createDirectoryIfMissing True dlf
   
+  let shf = dlf </> urlsfile cfg
+  (not <$> doesFileExist shf) >>= (`when` writeFile shf "")
   urls <- map read . lines <$> readFile (download_folder cfg </> urlsfile cfg)
   return cfg{alreadies_urls=urls}
   
@@ -70,3 +78,5 @@ handle_url_cache url = do
   let f = (snd<$>) . safe_head . filter ((==url) . fst)
   -- liftIO $ putStrLn $ ">>>>>>>>>>>>>>>>     " ++ show urls
   return $ f urls
+
+
