@@ -1,4 +1,4 @@
-# Haskell Crawler
+# Haskell Scraper
 
 Haskell library to recursively scrape a website and search for information
 
